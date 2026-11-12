@@ -324,37 +324,119 @@ h3,h4{overflow-wrap:anywhere}
 <script>
 (function(){
   var btn=document.getElementById('dlBtn'),label=btn.querySelector('span'),toast=document.getElementById('toast'),t;
-  function say(m){toast.textContent=m;toast.classList.add('show');clearTimeout(t);t=setTimeout(function(){toast.classList.remove('show')},2600)}
-  function loadLib(){
+  function say(m){toast.textContent=m;toast.classList.add('show');clearTimeout(t);t=setTimeout(function(){toast.classList.remove('show')},3000)}
+  function load(src,test){
     return new Promise(function(res,rej){
-      if(window.html2pdf)return res();
-      var sc=document.createElement('script');
-      sc.src='https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js';
-      sc.onload=function(){window.html2pdf?res():rej()};sc.onerror=rej;document.head.appendChild(sc);
+      if(test())return res();
+      var sc=document.createElement('script');sc.src=src;
+      sc.onload=function(){test()?res():rej()};sc.onerror=rej;document.head.appendChild(sc);
     });
   }
-  btn.addEventListener('click',function(){
-    var root=document.documentElement,prevTheme=root.getAttribute('data-theme');
-    btn.disabled=true;label.textContent='Hazırlanıyor…';
-    function restore(){
-      root.classList.remove('exporting');
-      if(prevTheme===null)root.removeAttribute('data-theme');else root.setAttribute('data-theme',prevTheme);
-      btn.disabled=false;label.textContent="CV'yi indir";
-    }
-    loadLib().then(function(){
-      root.setAttribute('data-theme','light');root.classList.add('exporting');
-      return (document.fonts?document.fonts.ready:Promise.resolve()).then(function(){
-        return html2pdf().set({
-          margin:[6,6,6,6],
-          filename:'Sumeyra_Eraslan_CV.pdf',
-          image:{type:'jpeg',quality:0.96},
-          html2canvas:{scale:2,useCORS:true,backgroundColor:'#ffffff',windowWidth:1100},
-          jsPDF:{unit:'mm',format:'a4',orientation:'portrait'},
-          pagebreak:{mode:['css','legacy'],avoid:['.entry-head','.project','.skill-group','.list li']}
-        }).from(document.querySelector('.page')).save();
+  function libs(){
+    return Promise.all([
+      load('https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js',function(){return !!window.html2canvas}),
+      load('https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js',function(){return !!(window.jspdf&&window.jspdf.jsPDF)})
+    ]);
+  }
+  var W=1100; /* masaüstü düzeni genişliği */
+
+  /* Sayfanın kopyasını gizli, sabit genişlikli bir çerçevede açık temada kurar */
+  function buildFrame(){
+    return new Promise(function(res){
+      var clone=document.documentElement.cloneNode(true);
+      clone.querySelectorAll('script,.toast').forEach(function(n){n.remove()});
+      clone.setAttribute('data-theme','light');clone.classList.add('exporting');
+      var f=document.createElement('iframe');
+      f.setAttribute('aria-hidden','true');f.tabIndex=-1;
+      f.style.cssText='position:fixed;left:-20000px;top:0;width:'+W+'px;height:2000px;border:0;visibility:hidden';
+      f.onload=function(){res(f)};
+      f.srcdoc='<!doctype html>'+clone.outerHTML;
+      document.body.appendChild(f);
+    });
+  }
+  function settle(doc){
+    var imgs=[].slice.call(doc.images).map(function(i){return i.complete?0:new Promise(function(r){i.onload=i.onerror=r})});
+    return Promise.all(imgs.concat([doc.fonts?doc.fonts.ready:0])).then(function(){return new Promise(function(r){setTimeout(r,150)})});
+  }
+  /* html2canvas SVG'lerde currentColor'ı çizemiyor: rengi ve boyutu sabitle */
+  function fixSvgs(doc){
+    doc.querySelectorAll('svg').forEach(function(svg){
+      var cs=doc.defaultView.getComputedStyle(svg),r=svg.getBoundingClientRect();
+      svg.setAttribute('width',r.width);svg.setAttribute('height',r.height);
+      svg.querySelectorAll('[stroke="currentColor"],[fill="currentColor"]').forEach(function(n){
+        if(n.getAttribute('stroke')==='currentColor')n.setAttribute('stroke',cs.color);
+        if(n.getAttribute('fill')==='currentColor')n.setAttribute('fill',cs.color);
       });
-    }).then(function(){restore();say('CV indirildi')})
-      .catch(function(){restore();say('Doğrudan indirme olmadı; yazdır penceresinden "PDF olarak kaydet"i seçin.');setTimeout(function(){window.print()},600)});
+      if(svg.getAttribute('stroke')==='currentColor')svg.setAttribute('stroke',cs.color);
+    });
+  }
+  /* Bölünmemesi gereken blokların dikey aralıkları (.page'e göre, CSS px) */
+  function blocks(page,sel){
+    var top=page.getBoundingClientRect().top;
+    return [].slice.call(page.querySelectorAll(sel)).map(function(el){
+      var r=el.getBoundingClientRect();return [r.top-top,r.bottom-top];
+    }).filter(function(b){return b[1]>b[0]});
+  }
+  function bestBreak(start,limit,ivs){
+    var cands=[];
+    ivs.forEach(function(b){cands.push(b[0]-6,b[1]+6)});
+    var best=-1;
+    cands.forEach(function(y){
+      if(y<=start+40||y>limit||y<=best)return;
+      for(var i=0;i<ivs.length;i++){if(y>ivs[i][0]-1&&y<ivs[i][1]+1)return}
+      best=y;
+    });
+    return best;
+  }
+  function breaks(page,pageH){
+    var total=page.scrollHeight,coarse=blocks(page,'header,h2,.entry-head,.entry>p,.project,.tags,.summary,.skill-group,.side-title,.list li'),
+        fine=blocks(page,'h2,h3,h4,.sub,.date,.tags span,.side-title,.list li,.summary,.project p,.entry>p');
+    /* Paragrafları satır satır böl: her satır ayrı blok sayılır */
+    var lines=[],top=page.getBoundingClientRect().top;
+    page.querySelectorAll('p,.list li,h3,h4').forEach(function(el){
+      var rg=el.ownerDocument.createRange();rg.selectNodeContents(el);
+      [].slice.call(rg.getClientRects()).forEach(function(r){if(r.height>0)lines.push([r.top-top,r.bottom-top])});
+    });
+    var out=[],y=0;
+    while(total-y>pageH){
+      var lim=y+pageH,b=bestBreak(y,lim,coarse);
+      if(b<y+pageH*0.55)b=Math.max(b,bestBreak(y,lim,fine.concat(lines).filter(function(iv){return true})));
+      if(b<=y+40)b=lim;
+      out.push([y,b]);y=b;
+    }
+    out.push([y,total]);
+    return out;
+  }
+
+  btn.addEventListener('click',function(){
+    var frame;
+    btn.disabled=true;label.textContent='Hazırlanıyor…';
+    function done(){if(frame)frame.remove();btn.disabled=false;label.textContent="CV'yi indir"}
+    libs().then(buildFrame).then(function(f){
+      frame=f;var doc=f.contentDocument;
+      return settle(doc).then(function(){
+        f.style.height=doc.documentElement.scrollHeight+'px';
+        fixSvgs(doc);
+        var page=doc.querySelector('.page'),cssW=page.offsetWidth;
+        var M=8,pw=210-2*M,ph=297-2*M,pxPerMm=cssW/pw,pageH=ph*pxPerMm;
+        var parts=breaks(page,pageH);
+        return window.html2canvas(page,{scale:2,useCORS:true,backgroundColor:'#ffffff',logging:false,
+          windowWidth:W,windowHeight:doc.documentElement.scrollHeight}).then(function(canvas){
+          var k=canvas.width/cssW,pdf=new window.jspdf.jsPDF({unit:'mm',format:'a4',orientation:'portrait'});
+          parts.forEach(function(p,i){
+            var sy=Math.round(p[0]*k),sh=Math.min(canvas.height,Math.round(p[1]*k))-sy;
+            if(sh<=0)return;
+            var c=document.createElement('canvas');c.width=canvas.width;c.height=sh;
+            var ctx=c.getContext('2d');ctx.fillStyle='#fff';ctx.fillRect(0,0,c.width,c.height);
+            ctx.drawImage(canvas,0,sy,canvas.width,sh,0,0,canvas.width,sh);
+            if(i>0)pdf.addPage();
+            pdf.addImage(c.toDataURL('image/jpeg',0.95),'JPEG',M,M,pw,sh/k/pxPerMm);
+          });
+          pdf.save('Sumeyra_Eraslan_CV.pdf');
+        });
+      });
+    }).then(function(){done();say('CV indirildi')})
+      .catch(function(e){console.error(e);done();say('Doğrudan indirme olmadı; yazdır penceresinden "PDF olarak kaydet"i seçin.');setTimeout(function(){window.print()},600)});
   });
 })();
 </script>
